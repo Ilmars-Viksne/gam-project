@@ -38,15 +38,15 @@ The primary research question is not whether a more complex model can fit the ob
 
 Let the predictors be
 
-\[
+$$
 \mathbf{x}=(X_1,X_2,X_3,X_4,X_5,X_6,X_7),
-\]
+$$
 
 and let the response contain four unordered classes:
 
-\[
+$$
 Y\in\{O,B,M,G\}.
-\]
+$$
 
 The project evaluates whether class membership can be modelled accurately and interpretably using additive spline functions, and whether pairwise interactions improve generalization beyond a main-effects-only model.
 
@@ -117,9 +117,9 @@ The initial model uses the following representation:
 
 ### Main-effects multiclass GAM
 
-For class \(k\), the class-specific score is
+For class $k$, the class-specific score is
 
-\[
+$$
 \eta_k(\mathbf{x})=
 \beta_{0k}
 +f_{1k}(X_1)
@@ -129,22 +129,22 @@ For class \(k\), the class-specific score is
 +f_{7k}(X_7)
 +\beta_{6k}\widetilde{X}_6
 +\gamma_k(X_3),
-\]
+$$
 
 where:
 
-- each \(f_{jk}\) is a univariate B-spline expansion;
-- \(\widetilde{X}_6\) is standardized `X6`;
-- \(\gamma_k(X_3)\) is a categorical main effect;
+- each $f_{jk}$ is a univariate B-spline expansion;
+- $\widetilde{X}_6$ is standardized `X6`;
+- $\gamma_k(X_3)$ is a categorical main effect;
 - no predictor products or pairwise surfaces are included.
 
 Class probabilities are produced by the softmax transformation:
 
-\[
+$$
 P(Y=k\mid\mathbf{x})=
 \frac{\exp(\eta_k(\mathbf{x}))}
 {\sum_\ell \exp(\eta_\ell(\mathbf{x}))}.
-\]
+$$
 
 The implementation is most precisely described as a **penalized multinomial logistic additive B-spline model**. L2 regularization is applied to the resulting spline and main-effect coefficients.
 
@@ -152,20 +152,20 @@ The implementation is most precisely described as a **penalized multinomial logi
 
 The interaction model extends the class score to
 
-\[
+$$
 \eta_k(\mathbf{x})=
 \beta_{0k}
 +\sum_j f_{jk}(x_j)
 +\sum_{(r,s)\in\mathcal I} f_{rsk}(x_r,x_s).
-\]
+$$
 
-For a selected pair \((X_r,X_s)\), the interaction is represented using a tensor-product spline basis:
+For a selected pair $(X_r,X_s)$, the interaction is represented using a tensor-product spline basis:
 
-\[
+$$
 f_{rsk}(x_r,x_s)=
 \sum_a\sum_b
 \theta_{krsab} B_{ra}(x_r)B_{sb}(x_s).
-\]
+$$
 
 All component main effects remain in the model. This follows the hierarchy principle: an interaction is not fitted without its corresponding main effects.
 
@@ -347,11 +347,11 @@ candidate_pairs = (
 
 ### Interaction scaling
 
-If an interaction design block is \(Z\), the model may receive
+If an interaction design block is $Z$, the model may receive
 
-\[
+$$
 Z^*=\alpha Z,
-\]
+$$
 
 where `interaction_scale = α`.
 
@@ -361,9 +361,9 @@ Under L2 regularization, a smaller interaction scale requires larger coefficient
 
 The observed paired outer-fold differences were defined as
 
-\[
+$$
 \Delta = \text{pairwise GAM} - \text{main-effects GAM}.
-\]
+$$
 
 | Metric | Mean difference | Standard deviation | Median difference |
 |---|---:|---:|---:|
@@ -405,9 +405,9 @@ minimum_log_loss_improvement = 0.005
 
 The improvement for a candidate pair is
 
-\[
+$$
 I=L_{\text{current}}-L_{\text{candidate}}.
-\]
+$$
 
 A positive value means the candidate reduces log loss.
 
@@ -415,23 +415,23 @@ A positive value means the candidate reduces log loss.
 
 Prefer the simpler model when its mean inner-CV log loss is within one standard error of the more complex candidate:
 
-\[
+$$
 L_{\text{simpler}}
 \leq
 L_{\text{best}}+SE(L_{\text{best}}).
-\]
+$$
 
 This prevents adding an interaction for an improvement too small to distinguish from resampling variation.
 
 ### Stability
 
-For pair \(p\), define selection stability as
+For pair $p$, define selection stability as
 
-\[
+$$
 S_p=
 \frac{\text{outer training sets selecting }p}
 {\text{number of outer training sets}}.
-\]
+$$
 
 Pragmatic interpretation:
 
@@ -608,9 +608,9 @@ python compare_models.py
 
 With
 
-\[
+$$
 \Delta=\text{pairwise}-\text{main},
-\]
+$$
 
 interpret differences as follows:
 
@@ -654,9 +654,9 @@ Full-data metrics are optimistic because the same observations were used for fit
 
 A class-specific main-effect curve shows the centered additive score contribution
 
-\[
+$$
 f_{jk}(x_j).
-\]
+$$
 
 A positive value raises the score assigned to the corresponding class relative to the curve’s centering convention. It is not a probability change and must not be interpreted causally.
 
@@ -664,9 +664,9 @@ A positive value raises the score assigned to the corresponding class relative t
 
 A class-specific interaction surface shows the pure tensor-product contribution
 
-\[
+$$
 f_{rsk}(x_r,x_s).
-\]
+$$
 
 Interpret surfaces only where observed data provide sufficient two-dimensional support. Correlated predictors may occupy a narrow diagonal region, leaving most of the rectangular plotting domain unsupported.
 
@@ -795,9 +795,9 @@ inner_n_jobs = 4
 
 For 5 knot values, 2 degrees, 6 values of `C`, 5 inner folds, and 25 outer evaluations:
 
-\[
+$$
 5\times2\times6\times5\times25=7500
-\]
+$$
 
 inner fits are required, excluding refits.
 
@@ -805,9 +805,9 @@ inner fits are required, excluding refits.
 
 For 3 knot values, 2 degrees, 3 interaction scales, 5 values of `C`, 5 inner folds, and 25 outer evaluations:
 
-\[
+$$
 3\times2\times3\times5\times5\times25=11250
-\]
+$$
 
 inner fits are required, excluding refits.
 
