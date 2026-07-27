@@ -1,11 +1,7 @@
 from __future__ import annotations
 
 # ============================================================
-# Configure a non-interactive Matplotlib backend.
-#
-# This must happen before importing matplotlib.pyplot.
-# It prevents Tkinter/TkAgg errors during joblib and
-# multiprocessing operations on Windows.
+# Configure a non-interactive Matplotlib backend before pyplot.
 # ============================================================
 
 import os
@@ -29,7 +25,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import sklearn
-
 from sklearn.compose import ColumnTransformer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
@@ -54,263 +49,362 @@ from sklearn.preprocessing import (
 )
 
 
+PREDICTOR_COLUMNS: tuple[str, ...] = (
+    "X1", "X2", "X3", "X4", "X5", "X6", "X7",
+)
+RESPONSE_COLUMN = "Y"
+EXPECTED_COLUMNS: tuple[str, ...] = (*PREDICTOR_COLUMNS, RESPONSE_COLUMN)
+
+
 # ============================================================
 # Configuration
 # ============================================================
 
-
 @dataclass(frozen=True)
 class GAMConfig:
-    """
-    Configuration for the classical multinomial GAM analysis.
-    """
+    """Configuration for the classical main-effects GAM analysis."""
 
     data_path: Path = Path("data/dataset.csv")
     output_directory: Path = Path("outputs")
+    target_column: str = RESPONSE_COLUMN
 
-    target_column: str = "Y"
+    # Current requested model representation.
+    smooth_features: tuple[str, ...] = ("X1", "X2", "X4", "X5", "X7",)
+    linear_features: tuple[str, ...] = ("X6",)
+    categorical_features: tuple[str, ...] = ("X3",)
 
-    # Predictors represented by univariate spline functions.
-    smooth_features: tuple[str, ...] = (
-        "X1",
-        "X2",
-        "X4",
-        "X5",
-        "X7",
-    )
-
-    # Low-resolution numerical predictor treated as a linear
-    # main effect rather than as a categorical variable.
-    linear_features: tuple[str, ...] = (
-        "X6",
-    )
-
-    # Ordered, low-resolution measurement treated as a
-    # categorical main effect in the initial model.
-    categorical_features: tuple[str, ...] = (
-        "X3",
-    )
-
-    # Preferred order for summaries and target validation.
-    class_order: tuple[str, ...] = (
-        "O",
-        "B",
-        "M",
-        "G",
-    )
-
+    class_order: tuple[str, ...] = ("O", "M",)
     random_state: int = 42
 
-    # Outer cross-validation estimates model generalization.
     outer_splits: int = 5
     outer_repeats: int = 5
-
-    # Inner cross-validation selects model complexity.
     inner_splits: int = 5
 
-    # Expanded grid following the initial boundary result.
-    n_knots_grid: tuple[int, ...] = (
-        4,
-        5,
-        6,
-        7,
-        8,
-    )
+    n_knots_grid: tuple[int, ...] = (4, 5, 6, 7, 8,)
+    degree_grid: tuple[int, ...] = (2, 3,)
+    c_grid: tuple[float, ...] = (0.01, 0.1, 1.0, 10.0, 30.0, 100.0,)
 
-    degree_grid: tuple[int, ...] = (
-        2,
-        3,
-    )
-
-    c_grid: tuple[float, ...] = (
-        0.01,
-        0.1,
-        1.0,
-        10.0,
-        30.0,
-        100.0,
-    )
-
-    # Keep serial during the stable Windows run.
-    #
-    # After verifying that the script works reliably with the
-    # Agg backend, this can be changed to -1 for the inner
-    # GridSearchCV operations.
+    # Keep only one CV level parallelized.
     inner_n_jobs: int = 1
-
-    # Keep the outer loop serial to avoid nested parallelism.
     outer_n_jobs: int = 1
 
 
 # ============================================================
-# Classical multinomial GAM
+# Classical main-effects GAM
 # ============================================================
 
-
 class ClassicalMultinomialGAM:
-    """
-    Penalized multinomial logistic additive B-spline model.
-
-    Model structure
-    ---------------
-
-    The class-specific linear score is:
-
-        eta_k(x)
-        =
-        intercept_k
-        + sum_j f_jk(x_j)
-        + sum_l beta_lk * x_l
-        + categorical effects
-
-    where:
-
-    - f_jk is represented by a univariate B-spline basis;
-    - numerical linear variables are standardized;
-    - categorical variables are one-hot encoded;
-    - multinomial logistic regression estimates class scores;
-    - L2 regularization controls coefficient magnitude;
-    - no pairwise interaction features are constructed.
-
-    Consequently, this is a main-effects-only additive model.
-    """
+    """Penalized logistic additive B-spline model with main effects."""
 
     def __init__(self, config: GAMConfig) -> None:
         self.config = config
-
         self.data: pd.DataFrame | None = None
         self.X: pd.DataFrame | None = None
         self.y: pd.Series | None = None
-
         self.grid_search: GridSearchCV | None = None
         self.best_model: Pipeline | None = None
 
     # --------------------------------------------------------
-    # Data loading
+    # Data loading and validation
     # --------------------------------------------------------
 
     def load_data(self) -> None:
-        """
-        Load, validate, and prepare the CSV dataset.
-        """
-
+        """Load the CSV, validate it, and construct X and y."""
         config = self.config
+        data_path = Path(config.data_path)
 
-        print(f"\nLoading data from:\n{config.data_path.resolve()}")
+        print("\nLoading data from:")
+        print(data_path.resolve())
 
-        if not config.data_path.exists():
+        if not data_path.exists():
             raise FileNotFoundError(
-                "The dataset was not found at:\n"
-                f"{config.data_path.resolve()}"
+                "Dataset file was not found:\n"
+                f"{data_path.resolve()}"
             )
 
-        df = pd.read_csv(config.data_path)
-
-        predictor_columns = [
-            *config.smooth_features,
-            *config.linear_features,
-            *config.categorical_features,
-        ]
-
-        required_columns = [
-            *predictor_columns,
-            config.target_column,
-        ]
-
-        missing_columns = sorted(
-            set(required_columns) - set(df.columns)
+        data = pd.read_csv(
+            data_path,
+            encoding="utf-8-sig",
+            skipinitialspace=True,
         )
+
+        if data.empty:
+            raise ValueError("The dataset contains no observations.")
+
+        data.columns = (
+            data.columns.astype(str)
+            .str.replace("\ufeff", "", regex=False)
+            .str.strip()
+        )
+
+        expected_columns = list(EXPECTED_COLUMNS)
+        observed_columns = data.columns.tolist()
+        missing_columns = [
+            column for column in expected_columns
+            if column not in observed_columns
+        ]
+        unexpected_columns = [
+            column for column in observed_columns
+            if column not in expected_columns
+        ]
 
         if missing_columns:
             raise ValueError(
-                "The following required columns are missing:\n"
-                f"{missing_columns}"
+                "The dataset is missing required columns.\n"
+                f"Missing: {missing_columns}\n"
+                f"Observed: {observed_columns}"
             )
-
-        # Retain only the columns used by this model.
-        df = df.loc[:, required_columns].copy()
-
-        # All seven predictors must initially be parseable as
-        # numerical measurements.
-        for column in predictor_columns:
-            df[column] = pd.to_numeric(
-                df[column],
-                errors="raise",
-            )
-
-        missing_counts = df[required_columns].isna().sum()
-
-        if missing_counts.any():
+        if unexpected_columns:
             raise ValueError(
-                "Missing values were found:\n"
-                f"{missing_counts[missing_counts > 0]}"
+                "The dataset contains unexpected columns.\n"
+                f"Unexpected: {unexpected_columns}\n"
+                f"Expected: {expected_columns}"
+            )
+
+        data = data.loc[:, expected_columns].copy()
+        predictor_columns = list(PREDICTOR_COLUMNS)
+        original_predictors = data.loc[:, predictor_columns].copy()
+
+        for column in predictor_columns:
+            if (
+                pd.api.types.is_object_dtype(data[column].dtype)
+                or pd.api.types.is_string_dtype(data[column].dtype)
+            ):
+                data[column] = data[column].astype("string").str.strip()
+            data[column] = pd.to_numeric(data[column], errors="coerce")
+
+        invalid_mask = (
+            data[predictor_columns].isna()
+            & original_predictors.notna()
+        )
+        if invalid_mask.any().any():
+            details = self._format_bad_cells(
+                invalid_mask, original_predictors, predictor_columns
+            )
+            raise ValueError(
+                "Non-numeric predictor values were found:\n" + details
+            )
+
+        missing_mask = data[predictor_columns].isna()
+        if missing_mask.any().any():
+            details = self._format_bad_cells(
+                missing_mask, data[predictor_columns], predictor_columns
+            )
+            raise ValueError(
+                "Missing predictor values were found:\n" + details
+            )
+
+        data[config.target_column] = (
+            data[config.target_column].astype("string").str.strip()
+        )
+        missing_response = (
+            data[config.target_column].isna()
+            | data[config.target_column].eq("")
+        )
+        if missing_response.any():
+            csv_rows = (np.flatnonzero(missing_response.to_numpy()) + 2).tolist()
+            raise ValueError(
+                "Missing response labels were found in CSV rows: "
+                f"{csv_rows[:20]}"
+            )
+
+        non_numeric = [
+            column for column in predictor_columns
+            if not pd.api.types.is_numeric_dtype(data[column])
+        ]
+        if non_numeric:
+            dtypes = {column: str(data[column].dtype) for column in non_numeric}
+            raise TypeError(
+                "Predictors remained non-numeric after conversion: "
+                f"{dtypes}"
+            )
+
+        predictor_array = data[predictor_columns].to_numpy(dtype=float)
+        if not np.isfinite(predictor_array).all():
+            locations = np.argwhere(~np.isfinite(predictor_array))
+            details = []
+            for row_position, column_position in locations[:20]:
+                details.append(
+                    f"CSV row {int(row_position) + 2}, "
+                    f"column {predictor_columns[int(column_position)]}: "
+                    f"{predictor_array[row_position, column_position]!r}"
+                )
+            raise ValueError(
+                "Non-finite predictor values were found:\n"
+                + "\n".join(details)
             )
 
         observed_classes = set(
-            df[config.target_column].astype(str).unique()
+            data[config.target_column].dropna().unique().tolist()
         )
-
         expected_classes = set(config.class_order)
-
-        unexpected_classes = (
-            observed_classes - expected_classes
-        )
-
-        missing_classes = (
-            expected_classes - observed_classes
-        )
-
+        unexpected_classes = observed_classes - expected_classes
+        missing_classes = expected_classes - observed_classes
         if unexpected_classes:
             raise ValueError(
-                "Unexpected target classes were found:\n"
-                f"{sorted(unexpected_classes)}"
+                "Unexpected response classes: "
+                f"{sorted(unexpected_classes)}; expected "
+                f"{list(config.class_order)}"
             )
-
         if missing_classes:
             raise ValueError(
-                "The following expected classes are absent:\n"
-                f"{sorted(missing_classes)}"
+                "Configured response classes are absent: "
+                f"{sorted(missing_classes)}; observed "
+                f"{sorted(observed_classes)}"
             )
 
-        # Preserve a meaningful class order for data summaries.
-        df[config.target_column] = pd.Categorical(
-            df[config.target_column],
-            categories=config.class_order,
-            ordered=False,
+        feature_groups = {
+            "smooth_features": config.smooth_features,
+            "linear_features": config.linear_features,
+            "categorical_features": config.categorical_features,
+        }
+
+        for group_name, features in feature_groups.items():
+            if isinstance(features, str):
+                raise TypeError(
+                    f"GAMConfig.{group_name} must be a tuple of "
+                    "feature names, but it is a string:\n"
+                    f"{features!r}\n"
+                    "For a one-element tuple, include a trailing "
+                    "comma, for example ('X6',)."
+                )
+
+            if not isinstance(features, tuple):
+                raise TypeError(
+                    f"GAMConfig.{group_name} must be a tuple, "
+                    f"not {type(features).__name__}."
+                )
+
+            invalid_names = [
+                feature
+                for feature in features
+                if not isinstance(feature, str)
+            ]
+
+            if invalid_names:
+                raise TypeError(
+                    f"GAMConfig.{group_name} contains non-string "
+                    f"feature names: {invalid_names}"
+                )
+
+        configured_features = (
+            config.smooth_features
+            + config.linear_features
+            + config.categorical_features
         )
 
-        # Only the categorical predictors are converted to
-        # strings. X6 remains numerical and is standardized.
+        duplicate_features = sorted(
+            {
+                feature
+                for feature in configured_features
+                if configured_features.count(feature) > 1
+            }
+        )
+
+        if duplicate_features:
+            raise ValueError(
+                "Predictors occur in more than one feature group: "
+                f"{duplicate_features}"
+            )
+
+        unknown_features = [
+            feature
+            for feature in configured_features
+            if feature not in predictor_columns
+        ]
+
+        if unknown_features:
+            raise ValueError(
+                "Configured model features are not available "
+                "predictors: "
+                f"{unknown_features}"
+            )
+
+        unused_features = [
+            feature
+            for feature in predictor_columns
+            if feature not in configured_features
+        ]
+
+        if unused_features:
+            raise ValueError(
+                "Predictors are not assigned to a model feature "
+                f"group: {unused_features}"
+            )
+
+        duplicate_features = sorted({
+            feature for feature in configured_features
+            if configured_features.count(feature) > 1
+        })
+        if duplicate_features:
+            raise ValueError(
+                "Predictors occur in more than one feature group: "
+                f"{duplicate_features}"
+            )
+        unknown_features = [
+            feature for feature in configured_features
+            if feature not in predictor_columns
+        ]
+        if unknown_features:
+            raise ValueError(
+                "Configured model features are not predictors: "
+                f"{unknown_features}"
+            )
+        unused_features = [
+            feature for feature in predictor_columns
+            if feature not in configured_features
+        ]
+        if unused_features:
+            raise ValueError(
+                "Predictors are not assigned to a feature group: "
+                f"{unused_features}"
+            )
+
+        config.output_directory.mkdir(parents=True, exist_ok=True)
+        self.data = data
+
+        model_columns = list(configured_features)
+        self.X = data.loc[:, model_columns].copy()
+        self.y = data[config.target_column].copy()
+
+        # Values are validated numerically first, then represented as
+        # stable strings only in the model matrix for OneHotEncoder.
         for column in config.categorical_features:
-            df[column] = df[column].astype(str)
+            self.X[column] = self.X[column].map(
+                lambda value: format(float(value), "g")
+            )
 
-        self.data = df
+        print("\nDataset loaded successfully.")
+        print("Dataset shape:", self.data.shape)
+        print("\nValidated source-data dtypes:")
+        print(self.data.dtypes.to_string())
+        print("\nModel-matrix dtypes:")
+        print(self.X.dtypes.to_string())
+        print("\nObserved response classes:")
+        print(self.y.value_counts().sort_index().to_string())
 
-        self.X = df.drop(
-            columns=config.target_column
-        ).copy()
-
-        # Scikit-learn's LogisticRegression will determine the
-        # internal class ordering. The fitted classifier's
-        # classes_ attribute is used consistently afterward.
-        self.y = df[config.target_column].astype(str)
-
-        config.output_directory.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
-    # --------------------------------------------------------
-    # Environment information
-    # --------------------------------------------------------
+    @staticmethod
+    def _format_bad_cells(
+        mask: pd.DataFrame,
+        values: pd.DataFrame,
+        columns: list[str],
+        maximum: int = 20,
+    ) -> str:
+        positions = np.argwhere(mask.to_numpy())
+        details: list[str] = []
+        for row_position, column_position in positions[:maximum]:
+            details.append(
+                f"CSV row {int(row_position) + 2}, "
+                f"column {columns[int(column_position)]}: "
+                f"{values.iloc[row_position, column_position]!r}"
+            )
+        if len(positions) > maximum:
+            details.append(f"... and {len(positions) - maximum} more cells")
+        return "\n".join(details)
 
     def save_environment_information(self) -> dict[str, str]:
-        """
-        Save package and execution-environment information.
-        """
-
-        config = self.config
-
+        """Save package, interpreter, platform, and backend information."""
+        self.config.output_directory.mkdir(parents=True, exist_ok=True)
         information = {
             "python_version": sys.version,
             "python_executable": sys.executable,
@@ -320,24 +414,11 @@ class ClassicalMultinomialGAM:
             "scikit_learn_version": sklearn.__version__,
             "matplotlib_version": matplotlib.__version__,
             "joblib_version": joblib.__version__,
-            "matplotlib_backend": matplotlib.get_backend(),
+            "matplotlib_backend": str(matplotlib.get_backend()),
         }
-
-        output_path = (
-            config.output_directory
-            / "environment_information.json"
-        )
-
-        with output_path.open(
-            "w",
-            encoding="utf-8",
-        ) as file:
-            json.dump(
-                information,
-                file,
-                indent=2,
-            )
-
+        path = self.config.output_directory / "environment_information.json"
+        with path.open("w", encoding="utf-8") as file:
+            json.dump(information, file, indent=2, ensure_ascii=False)
         return information
 
     # --------------------------------------------------------
@@ -345,196 +426,164 @@ class ClassicalMultinomialGAM:
     # --------------------------------------------------------
 
     def audit_data(self) -> dict[str, Any]:
-        """
-        Audit class counts, uniqueness, duplicates, outliers,
-        and predictor correlations.
-        """
+        """Audit dtypes, classes, duplicates, distributions, and X5."""
+        if self.data is None:
+            raise RuntimeError("Call load_data() before audit_data().")
 
-        self._require_loaded_data()
-
-        assert self.data is not None
-        assert self.X is not None
-        assert self.y is not None
-
-        config = self.config
-
-        predictor_columns = list(self.X.columns)
-
-        numerical_predictors = [
-            *config.smooth_features,
-            *config.linear_features,
+        data = self.data
+        predictor_columns = list(PREDICTOR_COLUMNS)
+        missing_columns = [
+            column for column in EXPECTED_COLUMNS
+            if column not in data.columns
         ]
+        if missing_columns:
+            raise ValueError(f"Loaded data are missing: {missing_columns}")
 
-        class_counts = (
-            self.y
-            .value_counts()
-            .reindex(
-                config.class_order,
-                fill_value=0,
+        non_numeric = [
+            column for column in predictor_columns
+            if not pd.api.types.is_numeric_dtype(data[column])
+        ]
+        if non_numeric:
+            dtypes = {column: str(data[column].dtype) for column in non_numeric}
+            raise TypeError(
+                "audit_data() requires numeric predictors: "
+                f"{dtypes}"
             )
+
+        row_count = int(len(data))
+        if row_count == 0:
+            raise ValueError("Cannot audit an empty dataset.")
+
+        missing_counts = data.isna().sum().astype(int).to_dict()
+        unique_counts = (
+            data[predictor_columns].nunique(dropna=False).astype(int).to_dict()
         )
-
-        class_proportions = (
-            class_counts / class_counts.sum()
+        class_counts_series = (
+            data[RESPONSE_COLUMN].value_counts(dropna=False).sort_index()
         )
-
-        unique_counts = self.X.nunique()
-
-        # True for every row that belongs to an exact duplicate
-        # predictor configuration.
-        duplicated_row_mask = self.X.duplicated(
-            keep=False
-        )
-
-        duplicate_groups = (
-            self.data
-            .groupby(
-                predictor_columns,
-                observed=True,
-                dropna=False,
-            )[config.target_column]
-            .agg(
-                number_of_rows="size",
-                number_of_labels="nunique",
-                labels=lambda values: ",".join(
-                    sorted(set(values.astype(str)))
-                ),
-            )
-            .reset_index()
-        )
-
-        duplicate_groups = duplicate_groups.loc[
-            duplicate_groups["number_of_rows"] > 1
-        ].copy()
-
-        conflicting_duplicates = (
-            duplicate_groups.loc[
-                duplicate_groups["number_of_labels"] > 1
-            ].copy()
-        )
-
-        x5_unusual = self.data.loc[
-            self.data["X5"] > 40
-        ].copy()
-
-        correlation_matrix = (
-            self.data[numerical_predictors]
-            .astype(float)
-            .corr()
-        )
-
-        descriptive_statistics = (
-            self.data[numerical_predictors]
-            .astype(float)
-            .describe()
-            .T
-        )
-
-        audit = {
-            "number_of_rows": int(
-                len(self.data)
-            ),
-            "number_of_predictors": int(
-                len(predictor_columns)
-            ),
-            "class_counts": {
-                str(key): int(value)
-                for key, value
-                in class_counts.items()
-            },
-            "class_proportions": {
-                str(key): float(value)
-                for key, value
-                in class_proportions.items()
-            },
-            "unique_values": {
-                str(key): int(value)
-                for key, value
-                in unique_counts.items()
-            },
-            "rows_in_duplicate_configurations": int(
-                duplicated_row_mask.sum()
-            ),
-            "number_of_duplicate_groups": int(
-                len(duplicate_groups)
-            ),
-            "conflicting_duplicate_groups": int(
-                len(conflicting_duplicates)
-            ),
-            "observations_with_x5_above_40": int(
-                len(x5_unusual)
-            ),
+        class_counts = {
+            str(name): int(count)
+            for name, count in class_counts_series.items()
+        }
+        class_proportions = {
+            str(name): float(count / row_count)
+            for name, count in class_counts_series.items()
         }
 
-        pd.DataFrame(
-            {
-                "class": class_counts.index,
-                "count": class_counts.values,
-                "proportion": class_proportions.values,
-            }
-        ).to_csv(
-            config.output_directory
-            / "class_distribution.csv",
-            index=False,
+        exact_duplicate_mask = data.duplicated(keep=False)
+        exact_duplicate_rows = data.loc[exact_duplicate_mask].copy()
+        duplicate_predictor_mask = data.duplicated(
+            subset=predictor_columns, keep=False
+        )
+        duplicate_predictor_rows = data.loc[duplicate_predictor_mask].copy()
+        duplicate_predictor_groups = (
+            duplicate_predictor_rows[predictor_columns].drop_duplicates()
         )
 
-        unique_counts.rename(
-            "number_of_unique_values"
-        ).to_csv(
-            config.output_directory
-            / "unique_value_counts.csv",
-            header=True,
+        labels_per_configuration = (
+            data.groupby(
+                predictor_columns,
+                dropna=False,
+                observed=True,
+            )[RESPONSE_COLUMN]
+            .nunique(dropna=False)
         )
+        conflicting_configurations = labels_per_configuration[
+            labels_per_configuration > 1
+        ]
 
-        correlation_matrix.to_csv(
-            config.output_directory
-            / "correlation_matrix.csv"
+        unusual_x5_mask = data["X5"].gt(40.0)
+        unusual_x5_rows = data.loc[unusual_x5_mask].copy()
+        descriptive_statistics = data[predictor_columns].describe().T
+        correlation_matrix = data[predictor_columns].corr(method="pearson")
+
+        audit: dict[str, Any] = {
+            "row_count": row_count,
+            "column_count": int(data.shape[1]),
+            "columns": data.columns.tolist(),
+            "dtypes": {
+                column: str(dtype) for column, dtype in data.dtypes.items()
+            },
+            "missing_value_counts": missing_counts,
+            "predictor_unique_counts": unique_counts,
+            "class_counts": class_counts,
+            "class_proportions": class_proportions,
+            "exact_duplicate_row_count": int(exact_duplicate_mask.sum()),
+            "duplicate_predictor_row_count": int(
+                duplicate_predictor_mask.sum()
+            ),
+            "duplicate_predictor_group_count": int(
+                len(duplicate_predictor_groups)
+            ),
+            "conflicting_predictor_configuration_count": int(
+                len(conflicting_configurations)
+            ),
+            "unusual_x5_threshold": 40.0,
+            "unusual_x5_count": int(unusual_x5_mask.sum()),
+            "unusual_x5_indices": unusual_x5_rows.index.astype(int).tolist(),
+        }
+
+        print(f"Observations: {row_count}")
+        print(f"Columns: {data.shape[1]}")
+        print("\nMissing values:")
+        print(pd.Series(missing_counts, name="missing_count").to_string())
+        print("\nClass distribution:")
+        print(pd.DataFrame({
+            "count": pd.Series(class_counts),
+            "proportion": pd.Series(class_proportions),
+        }).to_string())
+        print("\nUnique predictor values:")
+        print(pd.Series(unique_counts, name="unique_count").to_string())
+        print(
+            "\nNumber of exact duplicate rows: "
+            f"{int(exact_duplicate_mask.sum())}"
         )
-
-        descriptive_statistics.to_csv(
-            config.output_directory
-            / "descriptive_statistics.csv"
+        print(
+            "Rows belonging to duplicate predictor configurations: "
+            f"{int(duplicate_predictor_mask.sum())}"
         )
-
-        duplicate_groups.to_csv(
-            config.output_directory
-            / "duplicate_groups.csv",
-            index=False,
+        print(
+            "Duplicate predictor groups: "
+            f"{len(duplicate_predictor_groups)}"
         )
-
-        conflicting_duplicates.to_csv(
-            config.output_directory
-            / "conflicting_duplicate_groups.csv",
-            index=False,
+        print(
+            "Predictor configurations with conflicting labels: "
+            f"{len(conflicting_configurations)}"
         )
+        print(f"\nObservations with X5 > 40: {int(unusual_x5_mask.sum())}")
+        if unusual_x5_mask.any():
+            print("\nRows with X5 > 40:")
+            print(unusual_x5_rows.to_string(index=True))
 
-        x5_unusual.to_csv(
-            config.output_directory
-            / "unusual_x5_observations.csv",
-            index=False,
+        output = self.config.output_directory
+        output.mkdir(parents=True, exist_ok=True)
+        with (output / "data_audit.json").open("w", encoding="utf-8") as file:
+            json.dump(audit, file, indent=2, ensure_ascii=False)
+        descriptive_statistics.to_csv(output / "descriptive_statistics.csv")
+        correlation_matrix.to_csv(output / "predictor_correlations.csv")
+        unusual_x5_rows.to_csv(
+            output / "unusual_x5_observations.csv",
+            index=True,
+            index_label="row_id",
         )
-
-        with (
-            config.output_directory
-            / "data_audit.json"
-        ).open(
-            "w",
-            encoding="utf-8",
-        ) as file:
-            json.dump(
-                audit,
-                file,
-                indent=2,
+        exact_duplicate_rows.to_csv(
+            output / "exact_duplicate_rows.csv",
+            index=True,
+            index_label="row_id",
+        )
+        duplicate_predictor_rows.to_csv(
+            output / "duplicate_predictor_rows.csv",
+            index=True,
+            index_label="row_id",
+        )
+        if len(conflicting_configurations):
+            conflicting_configurations.rename("number_of_labels").to_csv(
+                output / "conflicting_predictor_configurations.csv"
             )
 
-        self._plot_class_distribution(
-            class_counts=class_counts
-        )
-
-        self._plot_correlation_matrix(
-            correlation_matrix=correlation_matrix
-        )
-
+        self._plot_class_distribution(class_counts_series)
+        self._plot_correlation_matrix(correlation_matrix)
+        print("\nData audit completed successfully.")
         return audit
 
     # --------------------------------------------------------
@@ -557,12 +606,10 @@ class ClassicalMultinomialGAM:
             order="C",
         )
 
-        # Standardization makes the single X6 linear coefficient
-        # numerically comparable and appropriately regularized.
         linear_transformer = StandardScaler()
 
         categorical_transformer = OneHotEncoder(
-            drop="first",
+            drop=None,
             handle_unknown="ignore",
             sparse_output=False,
         )
@@ -600,41 +647,29 @@ class ClassicalMultinomialGAM:
 
         return Pipeline(
             steps=[
-                ("preprocessor", preprocessor),
-                ("classifier", classifier),
+                (
+                    "preprocessor",
+                    preprocessor,
+                ),
+                (
+                    "classifier",
+                    classifier,
+                ),
             ]
         )
 
+
     def parameter_grid(self) -> dict[str, list[Any]]:
-        """
-        Hyperparameter grid used in the inner CV loop.
-        """
-
         config = self.config
-
         return {
-            "preprocessor__smooth__n_knots": list(
-                config.n_knots_grid
-            ),
-            "preprocessor__smooth__degree": list(
-                config.degree_grid
-            ),
-            "classifier__C": list(
-                config.c_grid
-            ),
+            "preprocessor__smooth__n_knots": list(config.n_knots_grid),
+            "preprocessor__smooth__degree": list(config.degree_grid),
+            "classifier__C": list(config.c_grid),
         }
 
-    def create_inner_cv(
-        self,
-        random_state: int | None = None,
-    ) -> StratifiedKFold:
-        """
-        Construct the inner stratified CV splitter.
-        """
-
+    def create_inner_cv(self, random_state: int | None = None) -> StratifiedKFold:
         if random_state is None:
             random_state = self.config.random_state
-
         return StratifiedKFold(
             n_splits=self.config.inner_splits,
             shuffle=True,
@@ -646,56 +681,55 @@ class ClassicalMultinomialGAM:
     # --------------------------------------------------------
 
     def evaluate_nested_cv(self) -> pd.DataFrame:
-        """
-        Estimate generalization performance using repeated,
-        stratified nested cross-validation.
-
-        Outer loop:
-            estimates performance.
-
-        Inner loop:
-            selects spline degree, knot count, and C.
-        """
-
+        """Estimate generalization with repeated nested CV."""
         self._require_loaded_data()
-
         assert self.X is not None
         assert self.y is not None
-
         config = self.config
 
-        base_pipeline = self.build_pipeline()
-
-        inner_cv = self.create_inner_cv()
+        if self.y.value_counts().min() < config.outer_splits:
+            raise ValueError(
+                "The smallest class has fewer observations than "
+                "outer_splits."
+            )
+        smallest_outer_training_class = int(
+            np.floor(
+                self.y.value_counts().min()
+                * (config.outer_splits - 1)
+                / config.outer_splits
+            )
+        )
+        if smallest_outer_training_class < config.inner_splits:
+            raise ValueError(
+                "An outer-training class may have fewer observations "
+                "than inner_splits."
+            )
 
         inner_search = GridSearchCV(
-            estimator=base_pipeline,
+            estimator=self.build_pipeline(),
             param_grid=self.parameter_grid(),
             scoring="neg_log_loss",
-            cv=inner_cv,
+            cv=self.create_inner_cv(),
             refit=True,
             n_jobs=config.inner_n_jobs,
             return_train_score=False,
             error_score="raise",
         )
-
         outer_cv = RepeatedStratifiedKFold(
             n_splits=config.outer_splits,
             n_repeats=config.outer_repeats,
             random_state=config.random_state,
         )
-
         scoring = {
             "log_loss": "neg_log_loss",
             "accuracy": "accuracy",
             "balanced_accuracy": "balanced_accuracy",
             "macro_f1": "f1_macro",
         }
-
         results = cross_validate(
-            estimator=inner_search,
-            X=self.X,
-            y=self.y,
+            inner_search,
+            self.X,
+            self.y,
             scoring=scoring,
             cv=outer_cv,
             n_jobs=config.outer_n_jobs,
@@ -704,325 +738,129 @@ class ClassicalMultinomialGAM:
             error_score="raise",
         )
 
-        number_of_outer_folds = len(
-            results["test_accuracy"]
-        )
-
-        fold_results = pd.DataFrame(
-            {
-                "fold": np.arange(
-                    1,
-                    number_of_outer_folds + 1,
-                ),
-                "repeat": (
-                    np.arange(number_of_outer_folds)
-                    // config.outer_splits
-                    + 1
-                ),
-                "fold_within_repeat": (
-                    np.arange(number_of_outer_folds)
-                    % config.outer_splits
-                    + 1
-                ),
-                "log_loss": -results[
-                    "test_log_loss"
-                ],
-                "accuracy": results[
-                    "test_accuracy"
-                ],
-                "balanced_accuracy": results[
-                    "test_balanced_accuracy"
-                ],
-                "macro_f1": results[
-                    "test_macro_f1"
-                ],
-                "fit_time_seconds": results[
-                    "fit_time"
-                ],
-                "score_time_seconds": results[
-                    "score_time"
-                ],
-            }
-        )
-
-        fitted_searches = results["estimator"]
-
-        best_parameters = [
-            fitted_search.best_params_
-            for fitted_search in fitted_searches
-        ]
-
+        number_of_folds = len(results["test_accuracy"])
+        zero_based = np.arange(number_of_folds)
+        fold_results = pd.DataFrame({
+            "fold": zero_based + 1,
+            "repeat": zero_based // config.outer_splits + 1,
+            "fold_within_repeat": zero_based % config.outer_splits + 1,
+            "log_loss": -results["test_log_loss"],
+            "accuracy": results["test_accuracy"],
+            "balanced_accuracy": results["test_balanced_accuracy"],
+            "macro_f1": results["test_macro_f1"],
+            "fit_time_seconds": results["fit_time"],
+            "score_time_seconds": results["score_time"],
+        })
+        searches = results["estimator"]
+        parameters = [search.best_params_ for search in searches]
         fold_results["best_n_knots"] = [
-            parameters[
-                "preprocessor__smooth__n_knots"
-            ]
-            for parameters in best_parameters
+            item["preprocessor__smooth__n_knots"] for item in parameters
         ]
-
         fold_results["best_degree"] = [
-            parameters[
-                "preprocessor__smooth__degree"
-            ]
-            for parameters in best_parameters
+            item["preprocessor__smooth__degree"] for item in parameters
         ]
-
         fold_results["best_C"] = [
-            parameters["classifier__C"]
-            for parameters in best_parameters
+            item["classifier__C"] for item in parameters
         ]
-
         fold_results["best_inner_log_loss"] = [
-            -float(fitted_search.best_score_)
-            for fitted_search in fitted_searches
+            -float(search.best_score_) for search in searches
         ]
 
-        fold_results.to_csv(
-            config.output_directory
-            / "nested_cv_fold_results.csv",
+        output = config.output_directory
+        fold_results.to_csv(output / "nested_cv_fold_results.csv", index=False)
+        metrics = ["log_loss", "accuracy", "balanced_accuracy", "macro_f1"]
+        summary = fold_results[metrics].agg(
+            ["mean", "std", "min", "median", "max"]
+        ).T
+        summary["standard_error"] = summary["std"] / np.sqrt(number_of_folds)
+        summary["ci_95_lower"] = summary["mean"] - 1.96 * summary["standard_error"]
+        summary["ci_95_upper"] = summary["mean"] + 1.96 * summary["standard_error"]
+        summary.to_csv(output / "nested_cv_summary.csv")
+        self._create_selection_frequency_table(fold_results).to_csv(
+            output / "nested_cv_hyperparameter_frequencies.csv",
             index=False,
         )
-
-        metric_columns = [
-            "log_loss",
-            "accuracy",
-            "balanced_accuracy",
-            "macro_f1",
-        ]
-
-        summary = (
-            fold_results[metric_columns]
-            .agg(
-                [
-                    "mean",
-                    "std",
-                    "min",
-                    "median",
-                    "max",
-                ]
-            )
-            .T
-        )
-
-        summary["standard_error"] = (
-            summary["std"]
-            / np.sqrt(number_of_outer_folds)
-        )
-
-        # Normal-approximation interval for descriptive use.
-        summary["ci_95_lower"] = (
-            summary["mean"]
-            - 1.96 * summary["standard_error"]
-        )
-
-        summary["ci_95_upper"] = (
-            summary["mean"]
-            + 1.96 * summary["standard_error"]
-        )
-
-        summary.to_csv(
-            config.output_directory
-            / "nested_cv_summary.csv"
-        )
-
-        selection_frequencies = self._create_selection_frequency_table(
-            fold_results=fold_results
-        )
-
-        selection_frequencies.to_csv(
-            config.output_directory
-            / "nested_cv_hyperparameter_frequencies.csv",
-            index=False,
-        )
-
-        self._plot_nested_cv_metrics(
-            fold_results=fold_results
-        )
-
-        self._plot_hyperparameter_frequencies(
-            fold_results=fold_results
-        )
-
+        self._plot_nested_cv_metrics(fold_results)
+        self._plot_hyperparameter_frequencies(fold_results)
         return fold_results
 
     # --------------------------------------------------------
-    # Final full-data model
+    # Final full-data model and diagnostics
     # --------------------------------------------------------
 
     def fit_final_model(self) -> GridSearchCV:
-        """
-        Tune and fit the final descriptive model using all rows.
-
-        This model is appropriate for effect visualization and
-        future prediction after the nested-CV evaluation has
-        already been completed.
-        """
-
         self._require_loaded_data()
-
         assert self.X is not None
         assert self.y is not None
-
         config = self.config
-
-        inner_cv = self.create_inner_cv()
-
         self.grid_search = GridSearchCV(
-            estimator=self.build_pipeline(),
-            param_grid=self.parameter_grid(),
+            self.build_pipeline(),
+            self.parameter_grid(),
             scoring="neg_log_loss",
-            cv=inner_cv,
+            cv=self.create_inner_cv(),
             refit=True,
             n_jobs=config.inner_n_jobs,
             return_train_score=True,
             error_score="raise",
         )
-
-        self.grid_search.fit(
-            self.X,
-            self.y,
-        )
-
-        self.best_model = (
-            self.grid_search.best_estimator_
-        )
-
+        self.grid_search.fit(self.X, self.y)
+        self.best_model = self.grid_search.best_estimator_
         joblib.dump(
             self.best_model,
-            config.output_directory
-            / "classical_gam_main_effects.joblib",
+            config.output_directory / "classical_gam_main_effects.joblib",
         )
-
         best_parameters = {
-            key: (
-                value.item()
-                if isinstance(value, np.generic)
-                else value
-            )
-            for key, value
-            in self.grid_search.best_params_.items()
+            key: value.item() if isinstance(value, np.generic) else value
+            for key, value in self.grid_search.best_params_.items()
         }
-
-        with (
-            config.output_directory
-            / "best_hyperparameters.json"
-        ).open(
-            "w",
-            encoding="utf-8",
+        with (config.output_directory / "best_hyperparameters.json").open(
+            "w", encoding="utf-8"
         ) as file:
-            json.dump(
-                best_parameters,
-                file,
-                indent=2,
-            )
-
-        cv_results = pd.DataFrame(
-            self.grid_search.cv_results_
-        )
-
-        cv_results.to_csv(
-            config.output_directory
-            / "final_model_grid_search_results.csv",
+            json.dump(best_parameters, file, indent=2)
+        pd.DataFrame(self.grid_search.cv_results_).to_csv(
+            config.output_directory / "final_model_grid_search_results.csv",
             index=False,
         )
-
         return self.grid_search
 
-    # --------------------------------------------------------
-    # Full-data descriptive diagnostics
-    # --------------------------------------------------------
-
     def full_data_diagnostics(self) -> dict[str, Any]:
-        """
-        Calculate descriptive fitted-data metrics.
-
-        These values are not estimates of generalization
-        performance because the same observations were used to
-        fit and evaluate the final model.
-        """
-
         self._require_fitted_model()
-
         assert self.best_model is not None
         assert self.X is not None
         assert self.y is not None
-
         config = self.config
-
-        probabilities = (
-            self.best_model.predict_proba(self.X)
-        )
-
-        predictions = (
-            self.best_model.predict(self.X)
-        )
-
-        classifier = self.best_model.named_steps[
-            "classifier"
-        ]
-
+        probabilities = self.best_model.predict_proba(self.X)
+        predictions = self.best_model.predict(self.X)
+        classifier = self.best_model.named_steps["classifier"]
         class_labels = classifier.classes_
-
-        probability_row_sums = probabilities.sum(
-            axis=1
-        )
-
         row_sum_error = float(
-            np.abs(
-                probability_row_sums - 1.0
-            ).max()
+            np.abs(probabilities.sum(axis=1) - 1.0).max()
         )
-
         if row_sum_error > 1e-10:
-            raise RuntimeError(
-                "Predicted class probabilities do not "
-                "sum to one within numerical tolerance."
-            )
+            raise RuntimeError("Predicted probabilities do not sum to one.")
 
         metrics = {
-            "accuracy": float(
-                accuracy_score(
-                    self.y,
-                    predictions,
-                )
-            ),
+            "accuracy": float(accuracy_score(self.y, predictions)),
             "balanced_accuracy": float(
-                balanced_accuracy_score(
-                    self.y,
-                    predictions,
-                )
+                balanced_accuracy_score(self.y, predictions)
             ),
-            "macro_f1": float(
-                f1_score(
-                    self.y,
-                    predictions,
-                    average="macro",
-                    zero_division=0,
-                )
-            ),
-            "multiclass_log_loss": float(
-                log_loss(
-                    self.y,
-                    probabilities,
-                    labels=class_labels,
-                )
-            ),
-            "maximum_probability_sum_error": (
-                row_sum_error
-            ),
+            "macro_f1": float(f1_score(
+                self.y,
+                predictions,
+                average="macro",
+                zero_division=0,
+            )),
+            "multiclass_log_loss": float(log_loss(
+                self.y,
+                probabilities,
+                labels=class_labels,
+            )),
+            "maximum_probability_sum_error": row_sum_error,
         }
-
-        with (
-            config.output_directory
-            / "full_data_descriptive_metrics.json"
-        ).open(
-            "w",
-            encoding="utf-8",
+        with (config.output_directory / "full_data_descriptive_metrics.json").open(
+            "w", encoding="utf-8"
         ) as file:
-            json.dump(
-                metrics,
-                file,
-                indent=2,
-            )
+            json.dump(metrics, file, indent=2)
 
         report = classification_report(
             self.y,
@@ -1031,437 +869,185 @@ class ClassicalMultinomialGAM:
             output_dict=True,
             zero_division=0,
         )
-
         pd.DataFrame(report).T.to_csv(
-            config.output_directory
-            / "full_data_classification_report.csv"
+            config.output_directory / "full_data_classification_report.csv"
         )
-
-        matrix = confusion_matrix(
-            self.y,
-            predictions,
-            labels=class_labels,
-        )
-
-        matrix_frame = pd.DataFrame(
+        matrix = confusion_matrix(self.y, predictions, labels=class_labels)
+        pd.DataFrame(
             matrix,
-            index=[
-                f"Observed_{label}"
-                for label in class_labels
-            ],
-            columns=[
-                f"Predicted_{label}"
-                for label in class_labels
-            ],
-        )
-
-        matrix_frame.to_csv(
-            config.output_directory
-            / "full_data_confusion_matrix.csv"
-        )
+            index=[f"Observed_{label}" for label in class_labels],
+            columns=[f"Predicted_{label}" for label in class_labels],
+        ).to_csv(config.output_directory / "full_data_confusion_matrix.csv")
 
         prediction_output = self.X.copy()
-
-        prediction_output[
-            "observed_class"
-        ] = self.y.values
-
-        prediction_output[
-            "predicted_class"
-        ] = predictions
-
-        for class_index, class_name in enumerate(
-            class_labels
-        ):
-            prediction_output[
-                f"probability_{class_name}"
-            ] = probabilities[:, class_index]
-
-        prediction_output["maximum_probability"] = (
-            probabilities.max(axis=1)
-        )
-
+        prediction_output["observed_class"] = self.y.to_numpy()
+        prediction_output["predicted_class"] = predictions
+        for index, name in enumerate(class_labels):
+            prediction_output[f"probability_{name}"] = probabilities[:, index]
+        prediction_output["maximum_probability"] = probabilities.max(axis=1)
         prediction_output["correct"] = (
             prediction_output["observed_class"]
             == prediction_output["predicted_class"]
         )
-
         prediction_output.to_csv(
-            config.output_directory
-            / "full_data_fitted_predictions.csv",
+            config.output_directory / "full_data_fitted_predictions.csv",
             index=False,
         )
-
-        self._plot_confusion_matrix(
-            matrix=matrix,
-            class_labels=class_labels,
-        )
-
+        self._plot_confusion_matrix(matrix, class_labels)
         self._export_transformed_coefficients()
-
         return metrics
 
     # --------------------------------------------------------
-    # Main-effect curves
+    # Main-effect plots and coefficient export
     # --------------------------------------------------------
 
     def plot_main_effects(
         self,
         grid_size: int = 200,
-        central_quantile_range: tuple[
-            float,
-            float,
-        ] = (
-            0.01,
-            0.99,
-        ),
+        central_quantile_range: tuple[float, float] = (0.01, 0.99),
     ) -> None:
-        """
-        Plot class-specific spline contributions.
-
-        Each curve represents the contribution of one predictor
-        to a class-specific multinomial score.
-
-        The plotted contribution is centered using the empirical
-        average contribution over the observed values.
-
-        These curves are additive score contributions. They are
-        not direct probability changes.
-        """
-
         self._require_fitted_model()
-
         assert self.best_model is not None
         assert self.X is not None
-
         config = self.config
-
-        preprocessor = self.best_model.named_steps[
-            "preprocessor"
-        ]
-
-        classifier = self.best_model.named_steps[
-            "classifier"
-        ]
-
-        spline_transformer = (
-            preprocessor.named_transformers_[
-                "smooth"
-            ]
+        preprocessor = self.best_model.named_steps["preprocessor"]
+        classifier = self.best_model.named_steps["classifier"]
+        spline_transformer = preprocessor.named_transformers_["smooth"]
+        class_labels, coefficients, _ = self._expanded_class_parameters(
+            classifier
         )
-
-        class_labels = classifier.classes_
-        coefficients = classifier.coef_
-
-        smooth_output_slice = (
-            preprocessor.output_indices_["smooth"]
-        )
-
-        smooth_coefficients = coefficients[
-            :,
-            smooth_output_slice,
-        ]
-
-        number_of_smooth_features = len(
-            config.smooth_features
-        )
-
-        total_spline_columns = (
-            smooth_coefficients.shape[1]
-        )
-
-        if (
-            total_spline_columns
-            % number_of_smooth_features
-            != 0
-        ):
+        smooth_slice = preprocessor.output_indices_["smooth"]
+        smooth_coefficients = coefficients[:, smooth_slice]
+        number_of_features = len(config.smooth_features)
+        if number_of_features == 0:
+            return
+        total_columns = smooth_coefficients.shape[1]
+        if total_columns % number_of_features != 0:
             raise RuntimeError(
-                "Unable to divide the spline output columns "
-                "equally among the smooth predictors."
+                "Spline output cannot be divided among smooth predictors."
             )
+        splines_per_feature = total_columns // number_of_features
+        lower_quantile, upper_quantile = central_quantile_range
 
-        splines_per_feature = (
-            total_spline_columns
-            // number_of_smooth_features
-        )
-
-        lower_quantile, upper_quantile = (
-            central_quantile_range
-        )
-
-        for feature_index, feature_name in enumerate(
-            config.smooth_features
-        ):
-            observed_values = (
-                self.X[feature_name]
-                .astype(float)
-                .to_numpy()
-            )
-
-            lower_limit = float(
-                np.quantile(
-                    observed_values,
-                    lower_quantile,
-                )
-            )
-
-            upper_limit = float(
-                np.quantile(
-                    observed_values,
-                    upper_quantile,
-                )
-            )
-
+        for feature_index, feature_name in enumerate(config.smooth_features):
+            observed = self.X[feature_name].astype(float).to_numpy()
             grid = np.linspace(
-                lower_limit,
-                upper_limit,
+                float(np.quantile(observed, lower_quantile)),
+                float(np.quantile(observed, upper_quantile)),
                 grid_size,
             )
-
-            # Use a DataFrame with the exact feature names used
-            # to fit SplineTransformer. This avoids the warning:
-            #
-            # "X does not have valid feature names..."
-            grid_reference = pd.DataFrame(
-                {
-                    column: np.full(
-                        grid_size,
-                        float(
-                            self.X[column]
-                            .astype(float)
-                            .median()
-                        ),
-                    )
-                    for column
-                    in config.smooth_features
-                }
-            )
-
-            grid_reference.loc[
-                :,
-                feature_name,
-            ] = grid
-
-            transformed_grid = (
-                spline_transformer.transform(
-                    grid_reference
+            grid_reference = pd.DataFrame({
+                column: np.full(
+                    grid_size,
+                    float(self.X[column].astype(float).median()),
                 )
-            )
+                for column in config.smooth_features
+            })
+            grid_reference.loc[:, feature_name] = grid
+            transformed_grid = spline_transformer.transform(grid_reference)
 
-            observed_reference = pd.DataFrame(
-                {
-                    column: np.full(
-                        len(observed_values),
-                        float(
-                            self.X[column]
-                            .astype(float)
-                            .median()
-                        ),
-                    )
-                    for column
-                    in config.smooth_features
-                }
-            )
-
-            observed_reference.loc[
-                :,
-                feature_name,
-            ] = observed_values
-
-            transformed_observed = (
-                spline_transformer.transform(
-                    observed_reference
+            observed_reference = pd.DataFrame({
+                column: np.full(
+                    len(observed),
+                    float(self.X[column].astype(float).median()),
                 )
+                for column in config.smooth_features
+            })
+            observed_reference.loc[:, feature_name] = observed
+            transformed_observed = spline_transformer.transform(
+                observed_reference
             )
+            start = feature_index * splines_per_feature
+            stop = start + splines_per_feature
+            grid_basis = transformed_grid[:, start:stop]
+            observed_basis = transformed_observed[:, start:stop]
 
-            local_start = (
-                feature_index
-                * splines_per_feature
-            )
-
-            local_stop = (
-                local_start
-                + splines_per_feature
-            )
-
-            grid_basis = transformed_grid[
-                :,
-                local_start:local_stop,
-            ]
-
-            observed_basis = transformed_observed[
-                :,
-                local_start:local_stop,
-            ]
-
-            figure, axis = plt.subplots(
-                figsize=(9, 5.5)
-            )
-
-            for class_index, class_name in enumerate(
-                class_labels
-            ):
-                local_coefficients = (
-                    smooth_coefficients[
-                        class_index,
-                        local_start:local_stop,
-                    ]
-                )
-
-                grid_contribution = (
-                    grid_basis
-                    @ local_coefficients
-                )
-
-                observed_contribution = (
-                    observed_basis
-                    @ local_coefficients
-                )
-
-                centered_contribution = (
-                    grid_contribution
-                    - observed_contribution.mean()
-                )
-
+            figure, axis = plt.subplots(figsize=(9, 5.5))
+            for class_index, class_name in enumerate(class_labels):
+                local = smooth_coefficients[class_index, start:stop]
+                contribution = grid_basis @ local
+                center = float((observed_basis @ local).mean())
                 axis.plot(
                     grid,
-                    centered_contribution,
+                    contribution - center,
                     linewidth=2,
                     label=str(class_name),
                 )
-
-            axis.axhline(
-                0.0,
-                color="black",
-                linewidth=0.8,
-                linestyle="--",
-            )
-
-            axis.set_title(
-                "Class-specific main effect of "
-                f"{feature_name}"
-            )
-
+            axis.axhline(0.0, color="black", linewidth=0.8, linestyle="--")
+            axis.set_title(f"Class-specific main effect of {feature_name}")
             axis.set_xlabel(feature_name)
-
-            axis.set_ylabel(
-                "Centered additive score contribution"
-            )
-
-            axis.legend(
-                title="Class"
-            )
-
-            axis.grid(
-                alpha=0.2
-            )
-
+            axis.set_ylabel("Centered additive score contribution")
+            axis.legend(title="Class")
+            axis.grid(alpha=0.2)
             figure.tight_layout()
-
             figure.savefig(
-                config.output_directory
-                / f"main_effect_{feature_name}.png",
+                config.output_directory / f"main_effect_{feature_name}.png",
                 dpi=180,
                 bbox_inches="tight",
             )
-
             plt.close(figure)
 
-    # --------------------------------------------------------
-    # Coefficient export
-    # --------------------------------------------------------
+    @staticmethod
+    def _expanded_class_parameters(
+        classifier: LogisticRegression,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return one mathematically equivalent score row per class."""
+        labels = np.asarray(classifier.classes_)
+        coefficients = np.asarray(classifier.coef_, dtype=float)
+        intercepts = np.asarray(classifier.intercept_, dtype=float)
+        if len(labels) == 2:
+            if coefficients.shape[0] != 1 or intercepts.shape[0] != 1:
+                raise RuntimeError(
+                    "Unexpected binary logistic parameter shapes: "
+                    f"coef={coefficients.shape}, "
+                    f"intercept={intercepts.shape}"
+                )
+            expanded_coefficients = np.vstack([
+                -0.5 * coefficients[0],
+                0.5 * coefficients[0],
+            ])
+            expanded_intercepts = np.array([
+                -0.5 * intercepts[0],
+                0.5 * intercepts[0],
+            ])
+            return labels, expanded_coefficients, expanded_intercepts
+        if coefficients.shape[0] != len(labels):
+            raise RuntimeError(
+                "Coefficient rows do not match classifier classes."
+            )
+        return labels, coefficients, intercepts
 
     def _export_transformed_coefficients(self) -> None:
-        """
-        Export coefficients for all transformed features.
-
-        The spline coefficients should not generally be
-        interpreted one at a time. Their combined contribution
-        is represented by the main-effect plots.
-        """
-
         self._require_fitted_model()
-
         assert self.best_model is not None
-
-        config = self.config
-
-        preprocessor = self.best_model.named_steps[
-            "preprocessor"
-        ]
-
-        classifier = self.best_model.named_steps[
-            "classifier"
-        ]
-
-        feature_names = (
-            preprocessor.get_feature_names_out()
+        preprocessor = self.best_model.named_steps["preprocessor"]
+        classifier = self.best_model.named_steps["classifier"]
+        feature_names = preprocessor.get_feature_names_out()
+        labels, coefficients, intercepts = self._expanded_class_parameters(
+            classifier
         )
-
-        coefficient_frames: list[pd.DataFrame] = []
-
-        for class_index, class_name in enumerate(
-            classifier.classes_
-        ):
-            class_frame = pd.DataFrame(
-                {
-                    "class": class_name,
-                    "transformed_feature": feature_names,
-                    "coefficient": (
-                        classifier.coef_[
-                            class_index,
-                            :
-                        ]
-                    ),
-                }
-            )
-
-            coefficient_frames.append(
-                class_frame
-            )
-
-        coefficient_table = pd.concat(
-            coefficient_frames,
-            ignore_index=True,
-        )
-
-        coefficient_table[
-            "absolute_coefficient"
-        ] = coefficient_table[
-            "coefficient"
-        ].abs()
-
-        coefficient_table = (
-            coefficient_table
-            .sort_values(
-                by=[
-                    "class",
-                    "absolute_coefficient",
-                ],
-                ascending=[
-                    True,
-                    False,
-                ],
-            )
-            .reset_index(drop=True)
-        )
-
-        coefficient_table.to_csv(
-            config.output_directory
-            / "transformed_feature_coefficients.csv",
+        frames = []
+        for index, name in enumerate(labels):
+            frames.append(pd.DataFrame({
+                "class": str(name),
+                "transformed_feature": feature_names,
+                "coefficient": coefficients[index],
+            }))
+        table = pd.concat(frames, ignore_index=True)
+        table["absolute_coefficient"] = table["coefficient"].abs()
+        table = table.sort_values(
+            ["class", "absolute_coefficient"],
+            ascending=[True, False],
+        ).reset_index(drop=True)
+        table.to_csv(
+            self.config.output_directory / "transformed_feature_coefficients.csv",
             index=False,
         )
-
-        intercept_table = pd.DataFrame(
-            {
-                "class": classifier.classes_,
-                "intercept": classifier.intercept_,
-            }
-        )
-
-        intercept_table.to_csv(
-            config.output_directory
-            / "class_intercepts.csv",
+        pd.DataFrame({
+            "class": labels,
+            "intercept": intercepts,
+        }).to_csv(
+            self.config.output_directory / "class_intercepts.csv",
             index=False,
         )
 
@@ -1473,200 +1059,73 @@ class ClassicalMultinomialGAM:
     def _create_selection_frequency_table(
         fold_results: pd.DataFrame,
     ) -> pd.DataFrame:
-        """
-        Create a tidy hyperparameter selection-frequency table.
-        """
+        frames = []
+        for column in ["best_n_knots", "best_degree", "best_C"]:
+            counts = fold_results[column].value_counts().sort_index()
+            frames.append(pd.DataFrame({
+                "hyperparameter": column,
+                "value": counts.index.astype(str),
+                "count": counts.to_numpy(),
+                "proportion": counts.to_numpy() / counts.sum(),
+            }))
+        return pd.concat(frames, ignore_index=True)
 
-        frames: list[pd.DataFrame] = []
-
-        for column in [
-            "best_n_knots",
-            "best_degree",
-            "best_C",
-        ]:
-            counts = (
-                fold_results[column]
-                .value_counts()
-                .sort_index()
-            )
-
-            frame = pd.DataFrame(
-                {
-                    "hyperparameter": column,
-                    "value": counts.index.astype(str),
-                    "count": counts.values,
-                    "proportion": (
-                        counts.values
-                        / counts.values.sum()
-                    ),
-                }
-            )
-
-            frames.append(frame)
-
-        return pd.concat(
-            frames,
-            ignore_index=True,
-        )
-
-    def _plot_class_distribution(
-        self,
-        class_counts: pd.Series,
-    ) -> None:
-        figure, axis = plt.subplots(
-            figsize=(7, 4.5)
-        )
-
-        positions = np.arange(
-            len(class_counts)
-        )
-
-        bars = axis.bar(
-            positions,
-            class_counts.values,
-        )
-
-        axis.set_xticks(
-            positions
-        )
-
-        axis.set_xticklabels(
-            class_counts.index
-        )
-
-        axis.set_xlabel(
-            "Class"
-        )
-
-        axis.set_ylabel(
-            "Number of observations"
-        )
-
-        axis.set_title(
-            "Class distribution"
-        )
-
-        for bar, count in zip(
-            bars,
-            class_counts.values,
-            strict=True,
-        ):
+    def _plot_class_distribution(self, class_counts: pd.Series) -> None:
+        figure, axis = plt.subplots(figsize=(7, 4.5))
+        positions = np.arange(len(class_counts))
+        bars = axis.bar(positions, class_counts.to_numpy())
+        axis.set_xticks(positions)
+        axis.set_xticklabels(class_counts.index.astype(str))
+        axis.set_xlabel("Class")
+        axis.set_ylabel("Number of observations")
+        axis.set_title("Class distribution")
+        for bar, count in zip(bars, class_counts.to_numpy(), strict=True):
             axis.text(
-                bar.get_x()
-                + bar.get_width() / 2,
+                bar.get_x() + bar.get_width() / 2,
                 bar.get_height(),
                 str(int(count)),
                 ha="center",
                 va="bottom",
             )
-
         figure.tight_layout()
-
         figure.savefig(
-            self.config.output_directory
-            / "class_distribution.png",
+            self.config.output_directory / "class_distribution.png",
             dpi=180,
             bbox_inches="tight",
         )
-
         plt.close(figure)
 
-    def _plot_correlation_matrix(
-        self,
-        correlation_matrix: pd.DataFrame,
-    ) -> None:
-        figure, axis = plt.subplots(
-            figsize=(7, 6)
-        )
-
-        image = axis.imshow(
-            correlation_matrix.to_numpy(),
-            vmin=-1,
-            vmax=1,
-        )
-
-        labels = correlation_matrix.columns
-
-        axis.set_xticks(
-            np.arange(len(labels))
-        )
-
-        axis.set_yticks(
-            np.arange(len(labels))
-        )
-
-        axis.set_xticklabels(
-            labels,
-            rotation=45,
-            ha="right",
-        )
-
-        axis.set_yticklabels(
-            labels
-        )
-
-        axis.set_title(
-            "Predictor correlation matrix"
-        )
-
-        for row in range(
-            correlation_matrix.shape[0]
-        ):
-            for column in range(
-                correlation_matrix.shape[1]
-            ):
-                value = correlation_matrix.iloc[
-                    row,
-                    column,
-                ]
-
+    def _plot_correlation_matrix(self, matrix: pd.DataFrame) -> None:
+        figure, axis = plt.subplots(figsize=(7, 6))
+        image = axis.imshow(matrix.to_numpy(), vmin=-1, vmax=1)
+        labels = matrix.columns
+        axis.set_xticks(np.arange(len(labels)))
+        axis.set_yticks(np.arange(len(labels)))
+        axis.set_xticklabels(labels, rotation=45, ha="right")
+        axis.set_yticklabels(labels)
+        axis.set_title("Predictor correlation matrix")
+        for row in range(matrix.shape[0]):
+            for column in range(matrix.shape[1]):
                 axis.text(
                     column,
                     row,
-                    f"{value:.2f}",
+                    f"{matrix.iloc[row, column]:.2f}",
                     ha="center",
                     va="center",
                 )
-
-        figure.colorbar(
-            image,
-            ax=axis,
-            label="Pearson correlation",
-        )
-
+        figure.colorbar(image, ax=axis, label="Pearson correlation")
         figure.tight_layout()
-
         figure.savefig(
-            self.config.output_directory
-            / "correlation_matrix.png",
+            self.config.output_directory / "correlation_matrix.png",
             dpi=180,
             bbox_inches="tight",
         )
-
         plt.close(figure)
 
-    def _plot_nested_cv_metrics(
-        self,
-        fold_results: pd.DataFrame,
-    ) -> None:
-        metric_columns = [
-            "log_loss",
-            "accuracy",
-            "balanced_accuracy",
-            "macro_f1",
-        ]
-
-        figure, axes = plt.subplots(
-            nrows=2,
-            ncols=2,
-            figsize=(11, 8),
-        )
-
-        for axis, metric in zip(
-            axes.ravel(),
-            metric_columns,
-            strict=True,
-        ):
+    def _plot_nested_cv_metrics(self, fold_results: pd.DataFrame) -> None:
+        metrics = ["log_loss", "accuracy", "balanced_accuracy", "macro_f1"]
+        figure, axes = plt.subplots(2, 2, figsize=(11, 8))
+        for axis, metric in zip(axes.ravel(), metrics, strict=True):
             axis.plot(
                 fold_results["fold"],
                 fold_results[metric],
@@ -1674,7 +1133,6 @@ class ClassicalMultinomialGAM:
                 linewidth=1,
                 markersize=4,
             )
-
             axis.axhline(
                 fold_results[metric].mean(),
                 linestyle="--",
@@ -1682,26 +1140,18 @@ class ClassicalMultinomialGAM:
                 color="black",
                 label="Mean",
             )
-
             axis.set_title(metric)
             axis.set_xlabel("Outer fold")
             axis.set_ylabel(metric)
             axis.grid(alpha=0.2)
             axis.legend()
-
-        figure.suptitle(
-            "Repeated nested cross-validation metrics"
-        )
-
+        figure.suptitle("Repeated nested cross-validation metrics")
         figure.tight_layout()
-
         figure.savefig(
-            self.config.output_directory
-            / "nested_cv_metrics.png",
+            self.config.output_directory / "nested_cv_metrics.png",
             dpi=180,
             bbox_inches="tight",
         )
-
         plt.close(figure)
 
     def _plot_hyperparameter_frequencies(
@@ -1709,73 +1159,27 @@ class ClassicalMultinomialGAM:
         fold_results: pd.DataFrame,
     ) -> None:
         settings = [
-            (
-                "best_n_knots",
-                "Selected number of knots",
-            ),
-            (
-                "best_degree",
-                "Selected spline degree",
-            ),
-            (
-                "best_C",
-                "Selected regularization parameter C",
-            ),
+            ("best_n_knots", "Selected number of knots"),
+            ("best_degree", "Selected spline degree"),
+            ("best_C", "Selected regularization parameter C"),
         ]
-
-        figure, axes = plt.subplots(
-            nrows=1,
-            ncols=3,
-            figsize=(14, 4.5),
-        )
-
-        for axis, (
-            column,
-            title,
-        ) in zip(
-            axes,
-            settings,
-            strict=True,
-        ):
-            counts = (
-                fold_results[column]
-                .value_counts()
-                .sort_index()
-            )
-
-            positions = np.arange(
-                len(counts)
-            )
-
-            axis.bar(
-                positions,
-                counts.values,
-            )
-
-            axis.set_xticks(
-                positions
-            )
-
-            axis.set_xticklabels(
-                [
-                    str(value)
-                    for value in counts.index
-                ]
-            )
-
+        figure, axes = plt.subplots(1, 3, figsize=(14, 4.5))
+        for axis, (column, title) in zip(axes, settings, strict=True):
+            counts = fold_results[column].value_counts().sort_index()
+            positions = np.arange(len(counts))
+            axis.bar(positions, counts.to_numpy())
+            axis.set_xticks(positions)
+            axis.set_xticklabels([str(value) for value in counts.index])
             axis.set_title(title)
             axis.set_xlabel("Value")
             axis.set_ylabel("Outer-fold selections")
-
         figure.tight_layout()
-
         figure.savefig(
             self.config.output_directory
             / "hyperparameter_selection_frequencies.png",
             dpi=180,
             bbox_inches="tight",
         )
-
         plt.close(figure)
 
     def _plot_confusion_matrix(
@@ -1783,55 +1187,22 @@ class ClassicalMultinomialGAM:
         matrix: np.ndarray,
         class_labels: np.ndarray,
     ) -> None:
-        figure, axis = plt.subplots(
-            figsize=(6.5, 5.5)
-        )
-
-        image = axis.imshow(
-            matrix
-        )
-
-        positions = np.arange(
-            len(class_labels)
-        )
-
-        axis.set_xticks(
-            positions
-        )
-
-        axis.set_yticks(
-            positions
-        )
-
-        axis.set_xticklabels(
-            class_labels
-        )
-
-        axis.set_yticklabels(
-            class_labels
-        )
-
-        axis.set_xlabel(
-            "Predicted class"
-        )
-
-        axis.set_ylabel(
-            "Observed class"
-        )
-
+        figure, axis = plt.subplots(figsize=(6.5, 5.5))
+        image = axis.imshow(matrix)
+        positions = np.arange(len(class_labels))
+        axis.set_xticks(positions)
+        axis.set_yticks(positions)
+        axis.set_xticklabels(class_labels)
+        axis.set_yticklabels(class_labels)
+        axis.set_xlabel("Predicted class")
+        axis.set_ylabel("Observed class")
         axis.set_title(
             "Full-data confusion matrix\n"
             "(descriptive, not a generalization estimate)"
         )
-
-        threshold = matrix.max() / 2
-
-        for row in range(
-            matrix.shape[0]
-        ):
-            for column in range(
-                matrix.shape[1]
-            ):
+        threshold = matrix.max() / 2 if matrix.size else 0
+        for row in range(matrix.shape[0]):
+            for column in range(matrix.shape[1]):
                 axis.text(
                     column,
                     row,
@@ -1839,27 +1210,16 @@ class ClassicalMultinomialGAM:
                     ha="center",
                     va="center",
                     color=(
-                        "white"
-                        if matrix[row, column]
-                        > threshold
-                        else "black"
+                        "white" if matrix[row, column] > threshold else "black"
                     ),
                 )
-
-        figure.colorbar(
-            image,
-            ax=axis,
-        )
-
+        figure.colorbar(image, ax=axis)
         figure.tight_layout()
-
         figure.savefig(
-            self.config.output_directory
-            / "full_data_confusion_matrix.png",
+            self.config.output_directory / "full_data_confusion_matrix.png",
             dpi=180,
             bbox_inches="tight",
         )
-
         plt.close(figure)
 
     # --------------------------------------------------------
@@ -1867,171 +1227,71 @@ class ClassicalMultinomialGAM:
     # --------------------------------------------------------
 
     def _require_loaded_data(self) -> None:
-        if (
-            self.data is None
-            or self.X is None
-            or self.y is None
-        ):
-            raise RuntimeError(
-                "Call load_data() before this operation."
-            )
+        if self.data is None or self.X is None or self.y is None:
+            raise RuntimeError("Call load_data() before this operation.")
 
     def _require_fitted_model(self) -> None:
         self._require_loaded_data()
-
         if self.best_model is None:
-            raise RuntimeError(
-                "Call fit_final_model() before this operation."
-            )
+            raise RuntimeError("Call fit_final_model() before this operation.")
 
 
 # ============================================================
 # Main execution
 # ============================================================
 
-
 def main() -> None:
     config = GAMConfig()
 
     print("=" * 60)
-    print("Classical multinomial GAM with main effects")
+    print("Classical logistic GAM with main effects")
     print("=" * 60)
+    print("\nMatplotlib backend:", matplotlib.get_backend())
+    print("Python executable:", sys.executable)
 
-    print(
-        "\nMatplotlib backend:",
-        matplotlib.get_backend(),
-    )
-
-    print(
-        "Python executable:",
-        sys.executable,
-    )
-
-    analysis = ClassicalMultinomialGAM(
-        config=config
-    )
-
+    analysis = ClassicalMultinomialGAM(config=config)
     analysis.load_data()
 
-    environment_information = (
-        analysis.save_environment_information()
-    )
-
+    environment_information = analysis.save_environment_information()
     print("\nExecution environment")
-
     for key, value in environment_information.items():
         print(f"{key}: {value}")
 
     print("\nRunning data audit...")
-
     audit = analysis.audit_data()
-
     print("\nData audit")
+    print(json.dumps(audit, indent=2))
 
-    print(
-        json.dumps(
-            audit,
-            indent=2,
-        )
-    )
-
-    print(
-        "\nRunning repeated nested cross-validation..."
-    )
-
-    fold_results = (
-        analysis.evaluate_nested_cv()
-    )
-
+    print("\nRunning repeated nested cross-validation...")
+    fold_results = analysis.evaluate_nested_cv()
     metric_columns = [
-        "log_loss",
-        "accuracy",
-        "balanced_accuracy",
-        "macro_f1",
+        "log_loss", "accuracy", "balanced_accuracy", "macro_f1",
     ]
+    nested_summary = fold_results[metric_columns].agg(["mean", "std"]).T
+    print("\nNested cross-validation summary")
+    print(nested_summary.round(4))
 
-    nested_summary = (
-        fold_results[metric_columns]
-        .agg(
-            [
-                "mean",
-                "std",
-            ]
-        )
-        .T
-    )
-
-    print(
-        "\nNested cross-validation summary"
-    )
-
-    print(
-        nested_summary.round(4)
-    )
-
-    print(
-        "\nHyperparameter selection frequencies"
-    )
-
-    for column in [
-        "best_n_knots",
-        "best_degree",
-        "best_C",
-    ]:
+    print("\nHyperparameter selection frequencies")
+    for column in ["best_n_knots", "best_degree", "best_C"]:
         print(f"\n{column}")
+        print(fold_results[column].value_counts().sort_index())
 
-        print(
-            fold_results[column]
-            .value_counts()
-            .sort_index()
-        )
-
-    print(
-        "\nFitting the final descriptive model..."
-    )
-
+    print("\nFitting the final descriptive model...")
     search = analysis.fit_final_model()
+    print("\nBest hyperparameters")
+    print(search.best_params_)
 
-    print(
-        "\nBest hyperparameters"
-    )
+    descriptive_metrics = analysis.full_data_diagnostics()
+    print("\nFull-data descriptive metrics")
+    print(json.dumps(descriptive_metrics, indent=2))
 
-    print(
-        search.best_params_
-    )
-
-    descriptive_metrics = (
-        analysis.full_data_diagnostics()
-    )
-
-    print(
-        "\nFull-data descriptive metrics"
-    )
-
-    print(
-        json.dumps(
-            descriptive_metrics,
-            indent=2,
-        )
-    )
-
-    print(
-        "\nGenerating main-effect plots..."
-    )
-
+    print("\nGenerating main-effect plots...")
     analysis.plot_main_effects()
 
-    print(
-        "\nAnalysis complete. Results were saved to:"
-    )
-
-    print(
-        config.output_directory.resolve()
-    )
+    print("\nAnalysis complete. Results were saved to:")
+    print(config.output_directory.resolve())
 
 
 if __name__ == "__main__":
-    # Required for reliable multiprocessing behavior on Windows.
     freeze_support()
-
     main()
